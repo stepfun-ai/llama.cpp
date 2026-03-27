@@ -87,6 +87,7 @@ enum mtmd_slice_tmpl {
     MTMD_SLICE_TMPL_LLAMA4,
     MTMD_SLICE_TMPL_IDEFICS3,
     MTMD_SLICE_TMPL_LFM2,
+    MTMD_SLICE_TMPL_STEP3VL,
 };
 
 const char * mtmd_default_marker() {
@@ -266,6 +267,20 @@ struct mtmd_context {
             tok_row_end       = {lookup_token("<|tile_y_separator|>")};
             tok_row_end_trail = true; // add trailing end-of-row token
             ov_img_first      = false; // overview image is last
+        } else if (proj == PROJECTOR_TYPE_STEP3VL) {
+            // Step3 format:
+            //   <patch_start> (patch) <patch_end> [<patch_newline>]
+            //   ... (all patch rows)
+            //   <im_start> (overview) <im_end>
+            // These tags wrap local patch embeddings and the final overview embedding.
+            slice_tmpl        = MTMD_SLICE_TMPL_STEP3VL;
+            tok_ov_img_start  = {lookup_token("<im_start>")};
+            tok_ov_img_end    = {lookup_token("<im_end>")};
+            tok_sli_img_start = {lookup_token("<patch_start>")};
+            tok_sli_img_end   = {lookup_token("<patch_end>")};
+            tok_row_end       = {lookup_token("<patch_newline>")};
+            tok_row_end_trail = false; // newline only between patch rows
+            ov_img_first      = false; // patches first, overview last
         }
 
         // set boi/eoi
@@ -587,6 +602,7 @@ struct mtmd_tokenizer {
                 || ctx->slice_tmpl == MTMD_SLICE_TMPL_MINICPMV_2_6
                 || ctx->slice_tmpl == MTMD_SLICE_TMPL_LLAMA4
                 || ctx->slice_tmpl == MTMD_SLICE_TMPL_IDEFICS3
+                || ctx->slice_tmpl == MTMD_SLICE_TMPL_STEP3VL
                 || (ctx->slice_tmpl == MTMD_SLICE_TMPL_LFM2 && has_tiling_grid)
             ) {
                 const int n_col = batch_f32.grid_x;

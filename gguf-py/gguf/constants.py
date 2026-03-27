@@ -302,6 +302,7 @@ class Keys:
         IMAGE_MIN_PIXELS    = "clip.vision.image_min_pixels"
         IMAGE_MAX_PIXELS    = "clip.vision.image_max_pixels"
         PREPROC_IMAGE_SIZE  = "clip.vision.preproc_image_size"
+        IMAGE_CROP_RESOLUTION = "clip.vision.image_crop_resolution"
         PATCH_SIZE          = "clip.vision.patch_size"
         EMBEDDING_LENGTH    = "clip.vision.embedding_length"
         FEED_FORWARD_LENGTH = "clip.vision.feed_forward_length"
@@ -496,6 +497,7 @@ class VISION_PROJECTOR_TYPE(IntEnum):
     GEMMA3N   = auto()
     GEMMA3    = auto()
     QWEN3VL   = auto()
+    STEP3VL   = auto()
     COGVLM    = auto()
 
 
@@ -940,6 +942,8 @@ VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
     VISION_PROJECTOR_TYPE.GLM_EDGE:  "adapter",
     VISION_PROJECTOR_TYPE.MERGER:    "qwen2vl_merger",
     VISION_PROJECTOR_TYPE.GEMMA3:    "gemma3",
+    VISION_PROJECTOR_TYPE.QWEN3VL:   "qwen3vl_merger",
+    VISION_PROJECTOR_TYPE.STEP3VL:   "step3vl",
 }
 
 TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
@@ -3888,6 +3892,7 @@ class VisionProjectorType:
     QWEN2VL = "qwen2vl_merger"
     QWEN25VL = "qwen2.5vl_merger"
     QWEN3VL = "qwen3vl_merger"
+    STEP3VL = "step3vl"
     ULTRAVOX = "ultravox"
     INTERNVL = "internvl"
     QWEN2A = "qwen2a" # audio

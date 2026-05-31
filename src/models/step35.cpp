@@ -26,7 +26,20 @@ void llama_model_step35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,   hparams.swiglu_clamp_exp,   hparams.n_layer, false);
     ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_clamp_shexp, hparams.n_layer, false);
 
-    switch (hparams.n_layer) {
+    // NextN/MTP heads — Step-3.7 trails the main transformer with
+    // num_nextn_predict_layers dense MTP blocks (model.layers.N..N+K-1 in HF).
+    // The converter appends them to block_count so n_layer reflects the total.
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+    GGML_ASSERT(hparams.nextn_predict_layers < hparams.n_layer && "nextn_predict_layers must be < n_layer");
+
+    // The MTP blocks are dense + full-attention even though the converter marks
+    // them as full_attention in swa_layers. Defensive: force full-attention.
+    for (uint32_t i = hparams.n_layer - hparams.nextn_predict_layers; i < hparams.n_layer; ++i) {
+        hparams.swa_layers[i] = false;
+    }
+
+    const uint32_t n_main_layer = hparams.n_layer - hparams.nextn_predict_layers;
+    switch (n_main_layer) {
         case 45: type = LLM_TYPE_196B_A11B; break;
         default: type = LLM_TYPE_UNKNOWN;
     }
@@ -34,6 +47,8 @@ void llama_model_step35::load_arch_hparams(llama_model_loader & ml) {
 
 void llama_model_step35::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
+
+    const int n_main = n_layer - (int) hparams.nextn_predict_layers;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
@@ -51,7 +66,7 @@ void llama_model_step35::load_arch_tensors(llama_model_loader &) {
         n_rot_max = n_rot;
     }
 
-    for (int i = 0; i < n_layer; ++i) {
+    auto load_block_trunk = [&](int i) {
         auto & layer = layers[i];
 
         const uint32_t n_head_l      = hparams.n_head(i);
@@ -95,10 +110,74 @@ void llama_model_step35::load_arch_tensors(llama_model_loader &) {
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, hparams.n_ff_shexp}, TENSOR_NOT_REQUIRED);
         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, hparams.n_ff_shexp}, TENSOR_NOT_REQUIRED);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {hparams.n_ff_shexp, n_embd}, TENSOR_NOT_REQUIRED);
+    };
+
+    // Step-3.7 MTP block layout (per HF safetensors index):
+    //   model.layers.{N..N+K-1}.{eh_proj, enorm, hnorm,
+    //                            input_layernorm, post_attention_layernorm,
+    //                            self_attn.{q,k,v,o,g}_proj, self_attn.{q,k}_norm,
+    //                            mlp.{gate,up,down}_proj,
+    //                            transformer.shared_head.{norm,output}}
+    // Each MTP head is a single transformer block with full attention and a
+    // DENSE SwiGLU MLP (not MoE). It owns its own LM head (shared head).
+    auto load_block_mtp = [&](int i) {
+        auto & layer = layers[i];
+
+        const uint32_t n_head_l      = hparams.n_head(i);
+        const uint32_t n_embd_k_gqa  = hparams.n_embd_k_gqa(i);
+        const uint32_t n_embd_v_gqa  = hparams.n_embd_v_gqa(i);
+
+        // Pre-attention norm
+        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+        // Standard Step35 attention block (q/k norm, head-wise gate, partial RoPE)
+        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, TENSOR_NOT_REQUIRED);
+        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, TENSOR_NOT_REQUIRED);
+
+        // rope factors (shared, see trunk)
+        if (hparams.rope_scaling_type_train == LLAMA_ROPE_SCALING_TYPE_LONGROPE) {
+            layer.rope_long  = create_tensor(tn(LLM_TENSOR_ROPE_FACTORS_LONG,  "weight", i), {n_rot_max/2}, TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED);
+            layer.rope_short = create_tensor(tn(LLM_TENSOR_ROPE_FACTORS_SHORT, "weight", i), {n_rot_max/2}, TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED);
+        } else {
+            layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {n_rot_max/2}, TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED);
+        }
+
+        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head_l, n_embd_k_gqa, n_embd_v_gqa, 0);
+        layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,  "weight", i), {n_embd_head_v * n_head_l, n_embd}, 0);
+        layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head_l}, TENSOR_NOT_REQUIRED);
+
+        // Dense SwiGLU MLP (mlp.gate_proj, mlp.up_proj, mlp.down_proj in HF)
+        // Sized via the standard ffn_dim (intermediate_size). `post_attention_layernorm`
+        // in the HF MTP block functions as the pre-FFN norm and therefore maps to
+        // FFN_NORM via the tensor name map.
+        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+
+        // NextN-specific tensors
+        layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), {2 * n_embd, n_embd}, 0);
+        layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd},             0);
+        layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd},             0);
+        // Step-3.7 has per-MTP-block shared head (transformer.shared_head.{norm,output}).
+        layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd},             TENSOR_NOT_REQUIRED);
+        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), {n_embd, n_vocab},    TENSOR_NOT_REQUIRED);
+        // Step-3.7 does not ship a per-block embed_tokens — main tok_embd is reused.
+        layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), {n_embd, n_vocab},    TENSOR_NOT_REQUIRED);
+    };
+
+    for (int i = 0; i < n_main; ++i) {
+        load_block_trunk(i);
+    }
+    for (int i = n_main; i < n_layer; ++i) {
+        load_block_mtp(i);
     }
 }
 
 std::unique_ptr<llm_graph_context> llama_model_step35::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -111,7 +190,10 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
     auto        * inp_attn    = build_attn_inp_kv_iswa();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    // Iterate only the main transformer stack; the trailing nextn_predict_layers
+    // blocks are MTP heads invoked via LLM_GRAPH_TYPE_DECODER_MTP.
+    const int n_transformer_layers = n_layer - (int) hparams.nextn_predict_layers;
+    for (int il = 0; il < n_transformer_layers; ++il) {
         ggml_tensor * inpSA = inpL;
 
         const uint32_t n_head_l    = hparams.n_head(il);
@@ -198,7 +280,7 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur, "attn_proj", il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_transformer_layers - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -257,6 +339,11 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
 
     cur = inpL;
 
+    // Expose the pre-norm hidden state — the MTP draft head consumes this as
+    // its `h_input` (the AR draft loop seeds successive MTP steps with it).
+    cb(cur, "h_pre_norm", -1);
+    res->t_h_pre_norm = cur;
+
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
@@ -265,5 +352,202 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
+    ggml_build_forward_expand(gf, cur);
+}
+
+// =============================================================================
+// MTP draft head graph (LLM_GRAPH_TYPE_DECODER_MTP)
+// =============================================================================
+//
+// Step-3.7-Flash ships num_nextn_predict_layers (typically 3) dense MTP blocks
+// trailing the main transformer. Each block is a single full-attention layer
+// with a dense SwiGLU MLP and its own LM head. The block predicts the token
+// one position ahead given (h_prev, prev_token) where h_prev is the pre-norm
+// hidden state from the previous step (trunk for the first MTP step, then the
+// previous MTP block's pre-norm output for subsequent chained MTP calls).
+//
+// To stay aligned with the existing speculative driver this graph follows the
+// Qwen3.5 MTP layout (single-block draft per invocation). For Step-3.7 we use
+// the FIRST MTP block (lowest index). Multi-step draft chains can be issued by
+// calling this graph repeatedly with refreshed (h, token) pairs.
+//
+// Graph layout per the reference HF tensors:
+//   h_norm     = RMSNorm_h(h_input)            // hnorm
+//   e_norm     = RMSNorm_e(embed(prev_token))  // enorm
+//   x          = eh_proj(concat(e_norm, h_norm, dim=0))
+//   attn_in    = input_layernorm(x)
+//   attn_out   = step35_self_attn(attn_in)
+//   x          = x + attn_out
+//   ffn_in     = post_attention_layernorm(x)
+//   ffn_out    = swiglu_mlp(ffn_in)
+//   h_next     = x + ffn_out
+//   logits     = shared_head_output(shared_head_norm(h_next))
+//
+// The attention block reuses the Step35 head-wise sigmoid gate and partial
+// rotary embeddings (full_attention => n_rot = head_dim/2).
+llama_model_step35::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
+    : llm_graph_context(params) {
+    GGML_ASSERT(hparams.nextn_predict_layers > 0 && "STEP35 MTP requires nextn_predict_layers > 0");
+
+    // Use the first MTP block (lowest index). Multi-block chains are driven
+    // externally by re-invoking this graph with refreshed (h, token) pairs.
+    const int il = (int) hparams.n_layer - (int) hparams.nextn_predict_layers;
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.nextn.eh_proj && "STEP35 MTP: missing nextn.eh_proj");
+    GGML_ASSERT(layer.nextn.enorm   && "STEP35 MTP: missing nextn.enorm");
+    GGML_ASSERT(layer.nextn.hnorm   && "STEP35 MTP: missing nextn.hnorm");
+    GGML_ASSERT(layer.ffn_gate && layer.ffn_up && layer.ffn_down && "STEP35 MTP: missing dense MLP weights");
+
+    // Input plumbing: the MTP graph takes (token_id, h_pre_norm_row) per draft
+    // position. We expose them through the standard llm_graph_input_embd.
+    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+    inp->embd   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->embd);
+    ggml_set_name(inp->embd, "mtp_h_input");
+
+    ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+
+    ggml_tensor * h_input  = inp->embd;
+    ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    res->add_input(std::move(inp));
+
+    ggml_tensor * inp_pos     = build_inp_pos();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    auto        * inp_attn    = build_attn_inp_kv();
+
+    // hnorm/enorm + eh_proj
+    ggml_tensor * h_norm = build_norm(h_input, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    cb(h_norm, "mtp_hnorm", il);
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    cb(e_norm, "mtp_enorm", il);
+
+    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
+    cb(concat, "mtp_concat", il);
+
+    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat);
+    cb(cur, "mtp_eh_proj", il);
+
+    ggml_tensor * inpSA = cur;
+
+    // -------------------------------------------------------------------------
+    // Step35-style attention block (mirrors graph::graph for full-attention)
+    // -------------------------------------------------------------------------
+    {
+        cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "mtp_attn_norm", il);
+
+        const uint32_t n_head_l    = hparams.n_head(il);
+        const uint32_t n_head_kv_l = hparams.n_head_kv(il);
+
+        ggml_tensor * Qcur = build_lora_mm(layer.wq, cur);
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur);
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur);
+        cb(Qcur, "mtp_Qcur", il);
+        cb(Kcur, "mtp_Kcur", il);
+        cb(Vcur, "mtp_Vcur", il);
+
+        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head_k, n_head_l,    n_tokens);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head_k, n_head_kv_l, n_tokens);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v, n_head_kv_l, n_tokens);
+
+        if (layer.attn_q_norm) {
+            Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
+            cb(Qcur, "mtp_Qcur_normed", il);
+        }
+        if (layer.attn_k_norm) {
+            Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+            cb(Kcur, "mtp_Kcur_normed", il);
+        }
+
+        // MTP block is full-attention (n_rot = head_dim/2 like main full-attn).
+        const float freq_base_l  = model.get_rope_freq_base(cparams, il);
+        const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
+        ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
+        const int64_t n_rot_l = hparams.n_rot(il);
+
+        Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, rope_factors,
+                n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, rope_factors,
+                n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(Qcur, "mtp_Qcur_pos", il);
+        cb(Kcur, "mtp_Kcur_pos", il);
+
+        const float kq_scale = 1.0f / sqrtf(float(n_embd_head_k));
+        ggml_tensor * attn_out = build_attn(inp_attn,
+                nullptr, nullptr, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        cb(attn_out, "mtp_attn_out_raw", il);
+
+        // head-wise sigmoid attention gate (g_proj)
+        if (layer.wqkv_gate) {
+            ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, cur);
+            cb(gate, "mtp_attn_gate", il);
+            gate = ggml_sigmoid(ctx0, gate);
+            cb(gate, "mtp_attn_gate_sigmoid", il);
+
+            ggml_tensor * attn_3d = ggml_reshape_3d(ctx0, attn_out, n_embd_head_v, n_head_l, n_tokens);
+            ggml_tensor * gate_3d = ggml_reshape_3d(ctx0, gate,     1,             n_head_l, n_tokens);
+            attn_3d = ggml_mul(ctx0, attn_3d, gate_3d);
+            attn_out = ggml_reshape_2d(ctx0, attn_3d, n_embd_head_v * n_head_l, n_tokens);
+            cb(attn_out, "mtp_attn_gated", il);
+        }
+
+        cur = build_lora_mm(layer.wo, attn_out);
+        cb(cur, "mtp_attn_proj", il);
+    }
+
+    cur = ggml_add(ctx0, cur, inpSA);
+    cb(cur, "mtp_attn_residual", il);
+
+    // -------------------------------------------------------------------------
+    // Dense SwiGLU MLP — Step-3.7 MTP blocks use a single dense MLP (not MoE).
+    // HF `post_attention_layernorm` functions as the pre-FFN norm (FFN_NORM).
+    // -------------------------------------------------------------------------
+    ggml_tensor * ffn_residual = cur;
+    GGML_ASSERT(layer.ffn_norm && "STEP35 MTP: missing ffn_norm (HF post_attention_layernorm)");
+    cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_ffn_norm", il);
+
+    cur = build_ffn(cur,
+            layer.ffn_up,   nullptr, nullptr,
+            layer.ffn_gate, nullptr, nullptr,
+            layer.ffn_down, nullptr, nullptr,
+            nullptr,
+            LLM_FFN_SILU, LLM_FFN_PAR, il);
+    cb(cur, "mtp_ffn_out", il);
+
+    cur = ggml_add(ctx0, cur, ffn_residual);
+    cb(cur, "mtp_post_ffn", il);
+
+    // Pre-norm hidden state for the AR draft loop (consumed as next h_input).
+    cb(cur, "h_pre_norm", -1);
+    res->t_h_pre_norm = cur;
+
+    if (inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
+    // Per-block shared head: use nextn.shared_head_norm / nextn.shared_head_head
+    // when present; otherwise fall back to the main output_norm / output (i.e.
+    // tied LM head when the MTP block has no dedicated head — Step-3.7 always
+    // ships a per-block head).
+    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
+    GGML_ASSERT(head_norm_w && "STEP35 MTP: missing shared_head_norm / output_norm");
+    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "mtp_shared_head_norm", -1);
+
+    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    GGML_ASSERT(head_w && "STEP35 MTP: missing shared_head_head / output");
+    cur = build_lora_mm(head_w, cur);
+    cb(cur, "result_output", -1);
+
+    res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
 }

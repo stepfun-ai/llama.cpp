@@ -2273,10 +2273,12 @@ class TensorNameMap:
 
         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD: (
             "model.layers.{bid}.shared_head.head",
+            "model.layers.{bid}.transformer.shared_head.output",  # step3.7
         ),
 
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
             "model.layers.{bid}.shared_head.norm",
+            "model.layers.{bid}.transformer.shared_head.norm",    # step3.7
         ),
     }
 

@@ -99,6 +99,19 @@ class Step3VLTextModel(Qwen3Model):
 class Step35Model(TextModel):
     model_arch = gguf.MODEL_ARCH.STEP35
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Step-3.7 ships NextN/MTP heads (num_nextn_predict_layers > 0) after the
+        # main transformer stack. We expose them as extra blocks (blk.N..blk.N+K-1)
+        # so the model loader can find their tensors under blk.%d.nextn.* and the
+        # final dense MLP / shared head tensors.
+        nextn = int(self.hparams.get("num_nextn_predict_layers", 0))
+        self._nextn_predict_layers = nextn
+        self._n_main_layers = int(self.hparams["num_hidden_layers"])
+        if nextn > 0:
+            self.block_count = self._n_main_layers + nextn
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
     def set_gguf_parameters(self):
         rope_theta = self.hparams.get("rope_theta")
         if isinstance(rope_theta, list):
@@ -109,8 +122,11 @@ class Step35Model(TextModel):
 
         super().set_gguf_parameters()
 
-        layer_types = self.hparams.get("layer_types") or []
-        partial_rotary_factors = self.hparams.get("partial_rotary_factors") or []
+        nextn = self._nextn_predict_layers
+        n_main = self._n_main_layers
+
+        layer_types = list(self.hparams.get("layer_types") or [])
+        partial_rotary_factors = list(self.hparams.get("partial_rotary_factors") or [])
         attn_other = self.hparams.get("attention_other_setting") or {}
 
         n_head_base = self.hparams["num_attention_heads"]
@@ -119,9 +135,19 @@ class Step35Model(TextModel):
         n_head_swa = attn_other.get("num_attention_heads", n_head_base)
         n_kv_swa = attn_other.get("num_attention_groups", n_kv_base)
 
-        layer_types = layer_types[: self.block_count]
-        partial_rotary_factors = partial_rotary_factors[: self.block_count]
+        # Trim the HF lists to the main transformer length first; the upstream
+        # config sometimes includes entries for the MTP heads, sometimes not.
+        layer_types = layer_types[:n_main]
+        partial_rotary_factors = partial_rotary_factors[:n_main]
         assert [1.0 if lt == "sliding_attention" else 0.5 for lt in layer_types] == partial_rotary_factors
+
+        # MTP heads are full-attention only and use the full-attention rope branch
+        # (half rope dims, base rope_theta). Extend per-layer arrays accordingly so
+        # the GGUF carries one entry per block.
+        if nextn > 0:
+            layer_types += ["full_attention"] * nextn
+            partial_rotary_factors += [0.5] * nextn
+
         head_arr = [n_head_swa if lt == "sliding_attention" else n_head_base for lt in layer_types]
         kv_arr = [n_kv_swa if lt == "sliding_attention" else n_kv_base for lt in layer_types]
         swa_pat = [lt == "sliding_attention" for lt in layer_types]
@@ -157,12 +183,21 @@ class Step35Model(TextModel):
 
         self.gguf_writer.add_layer_norm_rms_eps(self.hparams.get("rms_norm_eps", 1e-5))
 
-        # Optional per-layer SwiGLU clamps.
+        # NextN/MTP heads — Step-3.7 ships num_nextn_predict_layers dense MTP
+        # blocks after the main transformer (model.layers.N..N+K-1 in HF).
+        if self._nextn_predict_layers > 0:
+            self.gguf_writer.add_nextn_predict_layers(self._nextn_predict_layers)
+
+        # Optional per-layer SwiGLU clamps. Pad with 0.0 for the MTP blocks
+        # (MTP heads use a dense MLP without clamping), so the array length
+        # matches block_count.
         if (limits := self.hparams.get("swiglu_limits")) is not None:
-            limits_f = [0.0 if v is None else float(v) for v in limits[: self.block_count]]
+            limits_f = [0.0 if v is None else float(v) for v in limits[: self._n_main_layers]]
+            limits_f += [0.0] * self._nextn_predict_layers
             self.gguf_writer.add_swiglu_clamp_exp(limits_f)
         if (limits_shared := self.hparams.get("swiglu_limits_shared")) is not None:
-            limits_shared_f = [0.0 if v is None else float(v) for v in limits_shared[: self.block_count]]
+            limits_shared_f = [0.0 if v is None else float(v) for v in limits_shared[: self._n_main_layers]]
+            limits_shared_f += [0.0] * self._nextn_predict_layers
             self.gguf_writer.add_swiglu_clamp_shexp(limits_shared_f)
 
     @classmethod
@@ -175,11 +210,12 @@ class Step35Model(TextModel):
         return super().filter_tensors((name, gen))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
-        # remove mtp layers
+        # Step-3.7 MTP heads live at model.layers.{N..N+K-1}.{eh_proj,enorm,hnorm,...}
+        # We keep them when nextn_predict_layers > 0 (mapped via NEXTN_* tensors)
+        # and drop them otherwise to preserve backward compatibility with text-only conversion.
         if (m := re.match(r"model\.layers\.(\d+)\.", name)) is not None:
             il = int(m.group(1))
-            n_main = int(self.hparams.get("num_hidden_layers", self.block_count))
-            if il >= n_main:
+            if il >= self._n_main_layers and self._nextn_predict_layers == 0:
                 return
         if name.endswith("norm.weight"):
             data_torch += 1.0

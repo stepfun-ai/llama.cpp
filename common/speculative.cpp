@@ -418,6 +418,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     int32_t n_embd = 0;
 
+    // Number of trained MTP heads (n_layer_nextn). 1 = legacy single-block AR;
+    // >1 = multi-head chaining (head k runs at mtp_layer_offset k).
+    int32_t n_mtp_layers = 1;
+
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
     // call to pair with, so it's stashed here until that next call fires.
@@ -444,7 +448,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
-        n_embd = llama_model_n_embd(llama_get_model(ctx_dft));
+        n_embd        = llama_model_n_embd(llama_get_model(ctx_dft));
+        n_mtp_layers  = std::max(1, (int) llama_model_n_nextn_layer(llama_get_model(ctx_dft)));
+
+        // Each MTP head is used exactly once per draft round, so the draft
+        // length is capped at the number of heads. Clamp n_max accordingly.
+        if (n_mtp_layers > 1) {
+            this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
+        }
 
         LOG_INF("%s: adding speculative implementation 'draft-mtp'\n", __func__);
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
@@ -571,8 +582,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // Build the teacher-forcing batch ONCE — it is identical for every head:
+        // tokens at their real positions, tgt nextn-embd right-shifted by one,
+        // pending_h planted at each seq's first slot. llama_decode only reads the
+        // batch, so the same buffer is replayed per head; only the layer offset
+        // and the per-head KV reset differ.
         common_batch_clear(batch);
-
         for (int k = 0; k < n_tokens; ++k) {
             common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
         }
@@ -585,33 +600,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         {
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
             std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-
-            //{
-            //    // string with seq_ids in the batch
-            //    std::stringstream ss;
-            //    for (int i = 0; i < n_tokens; ++i) {
-            //        ss << batch_in.seq_id[i][0] << ",";
-            //    }
-            //    LOG_WRN("%s: batch_in.seq_id = %s\n", __func__, ss.str().c_str());
-            //}
+        }
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_beg[seq_id] < 0) continue;
+            std::memcpy(batch.embd + (size_t) i_batch_beg[seq_id] * n_embd,
+                        pending_h[seq_id].data(), row_bytes);
         }
 
-        // fill the pending embeddings from a previous run
-        auto set_h = [&](int idx, const float * h_row) {
-            std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-        };
+        auto * mem_dft = llama_get_memory(ctx_dft);
 
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_batch_beg[seq_id] < 0) {
-                continue;
+        bool ok = true;
+        for (int head = 0; head < n_mtp_layers; ++head) {
+            // n_mtp_layers == 1 keeps the legacy single-decode path byte-for-byte
+            // (no seq_rm, no offset switch). For >1 heads, reset each sequence's
+            // own batch region first so this head re-decodes the whole batch into
+            // a clean, position-aligned slot set (find_slot is deterministic given
+            // identical v_cells). Lower bound = this batch's first pos for the seq
+            // (prompt-multi-ubatch safe).
+            if (n_mtp_layers > 1) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) continue;
+                    llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+                }
+                llama_set_mtp_layer_offset(ctx_dft, head);
             }
 
-            set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+            const int32_t rc = llama_decode(ctx_dft, batch);
+            if (rc != 0) {
+                LOG_ERR("%s: llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                        __func__, head, (int) rc, (int) batch_in.pos[0]);
+                ok = false;
+                break;
+            }
         }
 
-        const int32_t rc = llama_decode(ctx_dft, batch);
-        if (rc != 0) {
-            LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", __func__, (int) rc, (int) batch_in.pos[0]);
+        if (n_mtp_layers > 1) {
+            llama_set_mtp_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+        }
+        if (!ok) {
             return false;
         }
 

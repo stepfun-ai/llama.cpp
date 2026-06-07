@@ -1113,6 +1113,10 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     cparams.embeddings_nextn_masked = masked;
 }
 
+void llama_context::set_mtp_layer_offset(int32_t offset) {
+    cparams.mtp_layer_offset = offset;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -3591,6 +3595,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_mtp_layer_offset(llama_context * ctx, int32_t offset) {
+    ctx->set_mtp_layer_offset(offset);
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
